@@ -29,3 +29,7 @@ Change `APP_NAME` in `build.sh` to rename the app. Settings are stored in `~/Lib
 
 - Uses the private `DisplayServices` framework to read the built-in brightness, so it can break with macOS updates.
 - Some monitors revert an input switch if the chosen input has no signal (Auto Select).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
