@@ -3,7 +3,7 @@
 # To rename the app, change APP_NAME here and rebuild; the Swift code reads the name from the bundle.
 set -e
 APP_NAME="Brightlink"
-BUNDLE_ID="com.anam.${APP_NAME:l}"
+BUNDLE_ID="com.nigirimonster.${APP_NAME:l}"
 
 cd "$(dirname "$0")"
 APP="$APP_NAME.app"

@@ -10,17 +10,41 @@ let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? Strin
 
 // MARK: - Config
 
-struct MonitorConfig: Codable {
+struct MonitorConfig: Codable, Equatable {
     var sync = true
     var offset = 0.0              // percentage points added to the mirrored brightness
     var minB = 10.0, maxB = 100.0 // monitor brightness at built-in 0% / 100%
     var minC = 60.0, maxC = 80.0  // monitor contrast at built-in 0% / 100%
     var volume = 50.0
+
+    init() {}
+
+    // Tolerate missing keys so a config written by an older version keeps the settings it has.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        sync = try c.decodeIfPresent(Bool.self, forKey: .sync) ?? sync
+        offset = try c.decodeIfPresent(Double.self, forKey: .offset) ?? offset
+        minB = try c.decodeIfPresent(Double.self, forKey: .minB) ?? minB
+        maxB = try c.decodeIfPresent(Double.self, forKey: .maxB) ?? maxB
+        minC = try c.decodeIfPresent(Double.self, forKey: .minC) ?? minC
+        maxC = try c.decodeIfPresent(Double.self, forKey: .maxC) ?? maxC
+        volume = try c.decodeIfPresent(Double.self, forKey: .volume) ?? volume
+    }
 }
 
 struct Config: Codable {
     var paused = false
     var monitors: [String: MonitorConfig] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? paused
+        monitors = try c.decodeIfPresent([String: MonitorConfig].self, forKey: .monitors) ?? monitors
+    }
 }
 
 let configURL: URL = {
@@ -37,20 +61,26 @@ let configURL: URL = {
 }()
 
 func loadConfig() -> Config {
-    guard let data = try? Data(contentsOf: configURL),
-          let cfg = try? JSONDecoder().decode(Config.self, from: data) else { return Config() }
-    return cfg
+    guard let data = try? Data(contentsOf: configURL) else { return Config() }
+    do {
+        return try JSONDecoder().decode(Config.self, from: data)
+    } catch {
+        // Keep the unreadable file instead of overwriting it with defaults on the next save.
+        try? FileManager.default.moveItem(at: configURL, to: configURL.appendingPathExtension("bad"))
+        return Config()
+    }
 }
 
 func saveConfig(_ cfg: Config) {
     let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-    try? enc.encode(cfg).write(to: configURL)
+    try? enc.encode(cfg).write(to: configURL, options: .atomic)
 }
 
 // MARK: - DDC and display discovery
 
-let m1ddcPath = ["/opt/homebrew/bin/m1ddc", "/usr/local/bin/m1ddc"]
-    .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "m1ddc"
+/// Only the Homebrew install locations are used, never the current folder or PATH.
+let m1ddcPath: String? = ["/opt/homebrew/bin/m1ddc", "/usr/local/bin/m1ddc"]
+    .first { FileManager.default.isExecutableFile(atPath: $0) }
 
 /// Set BRIGHTLINK_DEBUG=1 and run the binary from a terminal to see each DDC command.
 let debugEnabled = ProcessInfo.processInfo.environment["BRIGHTLINK_DEBUG"] != nil
@@ -58,16 +88,24 @@ func debug(_ message: @autoclosure () -> String) {
     if debugEnabled { FileHandle.standardError.write((message() + "\n").data(using: .utf8)!) }
 }
 
+/// Runs m1ddc and reports whether it succeeded. A call that hangs (some docks and monitors stall
+/// DDC) is killed after the timeout so it cannot block later writes.
 @discardableResult
-func ddc(_ args: [String]) -> String {
+func ddc(_ args: [String], timeout: TimeInterval = 3) -> Bool {
     debug("ddc \(args.joined(separator: " "))")
-    let p = Process(); let out = Pipe()
-    p.executableURL = URL(fileURLWithPath: m1ddcPath); p.arguments = args
-    p.standardOutput = out; p.standardError = Pipe()
-    do { try p.run() } catch { return "" }
-    p.waitUntilExit()
-    return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    guard let path = m1ddcPath else { return false }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    do { try p.run() } catch { return false }
+    if done.wait(timeout: .now() + timeout) == .timedOut { p.terminate(); return false }
+    return p.terminationStatus == 0
 }
+
+/// Rounds to a 0-100 percentage; non-finite input (from a hand-edited config) becomes 0.
+func percent(_ x: Double) -> Int { x.isFinite ? Int(min(100, max(0, x)).rounded()) : 0 }
 
 typealias GetBrightness = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
 let getBrightness: GetBrightness? = {
@@ -154,6 +192,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var invalidated = Set<String>()     // monitors changed while a sync was in flight
     private var builtinPct: Double?
     private var busy = false
+    private var resyncPending = false           // a resync was requested while a sync was in flight
+    private var saveWork: DispatchWorkItem?
     private var firstSeen: [String: Date] = [:]  // when each monitor last appeared awake
     private let queue = DispatchQueue(label: "ddc")
     private var volumeWork: [String: DispatchWorkItem] = [:]
@@ -173,6 +213,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Common modes keep the timer firing while a menu is open, so slider changes apply live.
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        timer.tolerance = 0.5
         RunLoop.main.add(timer, forMode: .common)
         tick()
     }
@@ -182,11 +223,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Mirrors the built-in brightness onto each synced monitor. DDC calls run off the main thread.
     private func tick() {
         guard !busy else { return }
-        // Lid closed: the built-in's brightness is meaningless, so leave monitors where they are.
-        guard let b = builtin() else { builtinPct = nil; updateIcon(); return }
-        builtinPct = b.brightness
-        invalidated.removeAll()
-        let cfg = config, sent = lastSent, sentContrast = lastContrast
+        // Refresh before the lid and pause checks so the menu stays accurate in clamshell mode.
         let mons = listExternals()   // sleeping displays are omitted, so none are written to while asleep
         externals = mons
 
@@ -195,41 +232,51 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         firstSeen = firstSeen.filter { key, _ in mons.contains { $0.uuid == key } }
         for m in mons where firstSeen[m.uuid] == nil { firstSeen[m.uuid] = now }
         let ready = mons.filter { now.timeIntervalSince(firstSeen[$0.uuid] ?? now) >= 3 }
+
+        // Lid closed: the built-in's brightness is meaningless, so leave monitors where they are.
+        guard let b = builtin() else { builtinPct = nil; updateIcon(); return }
+        builtinPct = b.brightness
+        guard !config.paused else { updateIcon(); return }
         debug("tick: builtin \(b.brightness), externals \(mons.map { $0.name }), ready \(ready.count)")
+
+        invalidated.removeAll()
+        resyncPending = false
+        let cfg = config, sent = lastSent, sentContrast = lastContrast
 
         busy = true
         queue.async {
             var newSent = sent.filter { key, _ in mons.contains { $0.uuid == key } }
             var newContrast = sentContrast.filter { key, _ in mons.contains { $0.uuid == key } }
-            if !cfg.paused {
-                for m in ready {
-                    let c = cfg.monitors[m.uuid] ?? MonitorConfig()
-                    guard c.sync else { continue }
-                    let target = Int(min(100, max(0, c.minB + b.brightness * (c.maxB - c.minB) + c.offset)).rounded())
-                    if abs(target - (newSent[m.uuid] ?? -100)) < 2 { continue }   // ignore auto-brightness jitter
-                    ddc(["display", m.uuid, "set", "luminance", String(target)])
-                    // Raising contrast with brightness keeps the image from looking washed out when bright.
-                    let contrast = Int((c.minC + b.brightness * (c.maxC - c.minC)).rounded())
-                    if contrast != newContrast[m.uuid] {
-                        ddc(["display", m.uuid, "set", "contrast", String(contrast)])
-                        newContrast[m.uuid] = contrast
-                    }
-                    newSent[m.uuid] = target
+            for m in ready {
+                let c = cfg.monitors[m.uuid] ?? MonitorConfig()
+                guard c.sync else { continue }
+                let target = percent(c.minB + b.brightness * (c.maxB - c.minB) + c.offset)
+                if abs(target - (newSent[m.uuid] ?? -100)) < 2 { continue }   // ignore auto-brightness jitter
+                // Record a value as sent only if the write succeeded, so a failed one is retried.
+                guard ddc(["display", m.uuid, "set", "luminance", String(target)]) else { continue }
+                newSent[m.uuid] = target
+                // Raising contrast with brightness keeps the image from looking washed out when bright.
+                let contrast = percent(c.minC + b.brightness * (c.maxC - c.minC))
+                if contrast != newContrast[m.uuid],
+                   ddc(["display", m.uuid, "set", "contrast", String(contrast)]) {
+                    newContrast[m.uuid] = contrast
                 }
             }
             DispatchQueue.main.async {
-                let changedMidSync = !self.invalidated.isEmpty
+                // Settings changed or a resync was requested while this sync ran: discard what it recorded.
+                let changedMidSync = !self.invalidated.isEmpty || self.resyncPending
+                if self.resyncPending { newSent.removeAll(); newContrast.removeAll() }
                 for u in self.invalidated { newSent.removeValue(forKey: u); newContrast.removeValue(forKey: u) }
                 self.lastSent = newSent
                 self.lastContrast = newContrast
                 self.busy = false
                 self.updateIcon()
-                if changedMidSync { self.tick() }   // apply a setting changed while this sync was running
+                if changedMidSync { self.tick() }
             }
         }
     }
 
-    private func resyncAll() { lastSent.removeAll(); lastContrast.removeAll() }
+    private func resyncAll() { resyncPending = true; lastSent.removeAll(); lastContrast.removeAll() }
 
     private func updateIcon() {
         let symbol = config.paused ? "sun.min" : "sun.max"
@@ -244,7 +291,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Monitors may have reset their settings while asleep, so resend everything. The wait before
     /// writing comes from `firstSeen` in `tick`.
-    @objc private func didWake() { resyncAll() }
+    @objc private func didWake() { firstSeen.removeAll(); resyncAll() }
 
     @objc private func screensChanged() { resyncAll() }
 
@@ -256,6 +303,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : builtinPct.map { "MacBook brightness \(Int($0 * 100))%" } ?? "Lid closed: holding monitors"
         let header = NSMenuItem(title: status, action: nil, keyEquivalent: ""); header.isEnabled = false
         menu.addItem(header)
+        if m1ddcPath == nil {
+            let missing = NSMenuItem(title: "m1ddc not found: brew install m1ddc", action: nil, keyEquivalent: "")
+            missing.isEnabled = false
+            menu.addItem(missing)
+        }
         menu.addItem(item("Sync brightness", #selector(toggleSync), on: !config.paused))
         menu.addItem(.separator())
 
@@ -330,15 +382,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func update(_ uuid: String, resync: Bool = true, _ change: (inout MonitorConfig) -> Void) {
-        var c = config.monitors[uuid] ?? MonitorConfig()
+        let old = config.monitors[uuid] ?? MonitorConfig()
+        var c = old
         change(&c)
+        guard c != old else { return }   // slider events that don't change the rounded value
         config.monitors[uuid] = c
-        saveConfig(config)
+        scheduleSave()
         if resync {
             lastSent.removeValue(forKey: uuid)
+            lastContrast.removeValue(forKey: uuid)
             invalidated.insert(uuid)
             tick()   // apply immediately so a slider shows its effect while being dragged
         }
+    }
+
+    /// Coalesces slider drags into one disk write.
+    private func scheduleSave() {
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            saveConfig(self.config)
+        }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     /// Coalesces slider drags into one DDC write.
@@ -355,7 +421,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleSync() {
         config.paused.toggle()
-        saveConfig(config); resyncAll(); updateIcon()
+        scheduleSave(); resyncAll(); updateIcon()
     }
 
     @objc private func toggleMonitor(_ sender: NSMenuItem) {
@@ -366,6 +432,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func resetMonitor(_ sender: NSMenuItem) {
         guard let uuid = sender.representedObject as? String else { return }
         update(uuid) { $0 = MonitorConfig() }
+        setVolume(uuid, MonitorConfig().volume)
     }
 
     @objc private func syncNow() { resyncAll(); tick() }
@@ -396,6 +463,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        saveWork?.cancel(); saveConfig(config)   // flush a pending debounced save
+    }
 }
 
 let app = NSApplication.shared
